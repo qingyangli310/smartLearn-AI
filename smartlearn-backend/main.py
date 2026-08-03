@@ -1,12 +1,12 @@
 import os
-import re
+from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from .services.llm import answer_from_pages
-from .services.pdf import extract_pages
+from .services import rag
 
 app = FastAPI(title="SmartLearn Lite API")
 
@@ -27,7 +27,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-documents: dict[str, list[dict]] = {}
+BACKEND_DIR = Path(__file__).resolve().parent
+UPLOAD_ROOT = BACKEND_DIR / "uploads"
+ARTIFACT_ROOT = Path(
+    os.getenv("RAG_ARTIFACT_ROOT", str(BACKEND_DIR / "artifacts" / "rag"))
+)
+
+documents: dict[str, dict] = {}
 
 
 class ChatRequest(BaseModel):
@@ -57,59 +63,67 @@ async def upload_pdf(chat_id: str, file: UploadFile = File(...)):
     if not pdf_bytes:
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
 
-    # 4. Extract pages (raises ValueError if > 30 pages)
+    # 4. Prepare a complete Day 3 record before replacing the active session.
     try:
-        pages = extract_pages(pdf_bytes)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    # 5. Reject scanned PDFs with no extractable text
-    if all(page["text"] == "" for page in pages):
-        raise HTTPException(
-            status_code=422,
-            detail="PDF contains no extractable text — scanned PDFs requiring OCR are not supported",
+        document = rag.prepare_rag_chat_record(
+            chat_id=chat_id,
+            filename=file.filename or "upload.pdf",
+            pdf_bytes=pdf_bytes,
+            upload_root=UPLOAD_ROOT,
+            artifact_root=ARTIFACT_ROOT,
         )
+    except ValueError as e:
+        if "no extractable text" in str(e).lower():
+            raise HTTPException(status_code=422, detail=str(e)) from e
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not prepare the PDF for retrieval.",
+        ) from e
 
-    # 6. Store pages in memory (no disk write)
-    documents[chat_id] = pages
+    documents[chat_id] = document
+    return rag.build_upload_response(document)
 
-    # 7. Success response
-    total_chars = sum(len(page["text"]) for page in pages)
-    return {
-        "status": "ok",
-        "filename": file.filename,
-        "pages": len(pages),
-        "characters": total_chars,
-    }
+
+@app.get("/documents/{chat_id}/file")
+def get_document_file(chat_id: str):
+    document = documents.get(chat_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document session not found")
+
+    raw_path = document.get("file_path") or document.get("saved_pdf_path")
+    file_path = Path(raw_path) if raw_path else None
+    if file_path is None or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Uploaded PDF file not found")
+
+    return FileResponse(file_path, media_type="application/pdf")
 
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
-    # 1. Look up stored pages
-    pages = documents.get(request.chat_id)
-    if pages is None:
+    document = documents.get(request.chat_id)
+    if document is None:
         raise HTTPException(
             status_code=404,
             detail=f"No PDF uploaded for chat_id '{request.chat_id}'. Please upload a PDF first.",
         )
 
-    # 2. Call LLM (upstream failure → 502, no internal details leaked)
     try:
-        answer = answer_from_pages(pages, request.message)
-    except Exception:
+        result = rag.answer_chat_turn(
+            document=document,
+            message=request.message,
+            top_k=3,
+            candidate_pool=60,
+        )
+    except Exception as e:
         raise HTTPException(
             status_code=502,
-            detail="Upstream AI service failed. Please try again later.",
-        )
+            detail="Document retrieval failed. Please try again later.",
+        ) from e
 
-    # 3. Extract [Page X] citations from the answer
-    raw_numbers = re.findall(r"\[Page\s+(\d+)\]", answer)
-
-    # 4. Keep only pages that exist, deduplicate, sort
-    valid_pages = {page["page"] for page in pages}
-    citations = sorted(set(
-        int(n) for n in raw_numbers if int(n) in valid_pages
-    ))
-
-    # 5. Response
-    return {"answer": answer, "citations": citations}
+    return {
+        "answer": result["answer"],
+        "citations": result["citations"],
+        "sources": result["sources"],
+    }

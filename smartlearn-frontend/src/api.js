@@ -4,12 +4,12 @@ export const API =
 export const CHAT_ID = "day2-demo";
 
 async function readJSON(response) {
-  const data = await response.json().catch(() => ({}))
+  const data = await response.json().catch(() => ({}));
 
   if (!response.ok) {
     const detail =
       data.detail || `Request failed (${response.status})`
-    throw new Error(detail)
+    throw new Error(detail);
   }
 
   return data
@@ -35,4 +35,12 @@ export async function askQuestion(message) {
   });
 
   return readJSON(res);
+}
+
+export function getDocumentFileURL(page = 1, previewKey = null) {
+  const safePage = Number.isInteger(page) && page > 0 ? page : 1;
+  const refreshQuery = previewKey === null
+    ? ""
+    : `?preview=${encodeURIComponent(previewKey)}`;
+  return `${API}/documents/${encodeURIComponent(CHAT_ID)}/file${refreshQuery}#page=${safePage}`;
 }

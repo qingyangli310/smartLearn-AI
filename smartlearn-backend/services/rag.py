@@ -84,6 +84,24 @@ def extract_pages_for_rag(
     return records
 
 
+def extract_pages_from_bytes_for_rag(pdf_bytes: bytes) -> list[dict]:
+    """Extract cleaned, page-numbered records from uploaded PDF bytes.
+
+    Unlike the Day 2 loader, this path intentionally has no 30-page limit.
+    Empty pages are skipped while the original PDF page numbers are retained.
+    """
+    if not pdf_bytes:
+        raise ValueError("pdf_bytes must not be empty")
+
+    reader = PdfReader(BytesIO(pdf_bytes))
+    records: list[dict] = []
+    for page_number, page in enumerate(reader.pages, start=1):
+        cleaned = clean_text(page.extract_text() or "")
+        if cleaned:
+            records.append({"page": page_number, "text": cleaned})
+    return records
+
+
 def save_json(data: Any, path: Union[str, Path]) -> None:
     """Save a Python object as UTF‑8 JSON.  Parent directories are
     created if they do not exist."""
@@ -314,6 +332,18 @@ def resolve_model_source(
 
     backend_root = Path(__file__).resolve().parents[1]
     candidates.append(backend_root / "artifacts" / "rag" / "hf_models" / local_name)
+
+    configured_model_root = os.getenv("RAG_EMBED_MODEL_PATH")
+    if configured_model_root:
+        candidates.append(Path(configured_model_root).expanduser())
+
+    # Workshop folders commonly sit next to the repository. Reusing their
+    # downloaded model keeps the backend functional when network access is off.
+    workspace_parent = Path(__file__).resolve().parents[3]
+    for lab_folder in ("Day3", "Day3_Lab"):
+        candidates.append(
+            workspace_parent / lab_folder / "artifacts" / "hf_models" / local_name
+        )
 
     for candidate in candidates:
         if _local_model_ready(candidate):
@@ -725,6 +755,96 @@ def prepare_rag_document(
     }
 
 
+def prepare_rag_chat_record(
+    chat_id: str,
+    filename: str,
+    pdf_bytes: Union[bytes, None] = None,
+    pages: Union[list[dict], None] = None,
+    upload_root: Union[str, Path, None] = None,
+    chunk_mode: str = "character_overlap",
+    chunk_size: int = 700,
+    overlap: int = 120,
+    model_name: str = DEFAULT_EMBED_MODEL_NAME,
+    batch_size: int = 32,
+    artifact_root: Union[str, Path, None] = None,
+) -> dict:
+    """Build the in-memory record stored under ``documents[chat_id]``.
+
+    The caller may provide uploaded bytes or already extracted page records.
+    When bytes are supplied, the PDF is saved only after the RAG assets have
+    been prepared successfully, preventing a failed upload from leaving a
+    half-written session file behind.
+    """
+    if not chat_id.strip():
+        raise ValueError("chat_id must not be empty")
+    if not filename.strip():
+        raise ValueError("filename must not be empty")
+    if pdf_bytes is None and pages is None:
+        raise ValueError("Provide pdf_bytes or pages")
+
+    active_pages = pages
+    if active_pages is None:
+        active_pages = extract_pages_from_bytes_for_rag(pdf_bytes or b"")
+    if not active_pages:
+        raise ValueError("PDF contains no extractable text")
+
+    document = prepare_rag_document(
+        document_id=chat_id,
+        filename=filename,
+        pages=active_pages,
+        chunk_mode=chunk_mode,
+        chunk_size=chunk_size,
+        overlap=overlap,
+        model_name=model_name,
+        batch_size=batch_size,
+        artifact_root=artifact_root,
+    )
+
+    saved_pdf_path = ""
+    if pdf_bytes is not None:
+        target_root = (
+            Path(upload_root)
+            if upload_root is not None
+            else Path(__file__).resolve().parents[1] / "uploads"
+        )
+        target_root.mkdir(parents=True, exist_ok=True)
+        safe_chat_id = re.sub(r"[^A-Za-z0-9._-]+", "_", chat_id).strip("._-")
+        if not safe_chat_id:
+            safe_chat_id = hashlib.sha256(chat_id.encode("utf-8")).hexdigest()[:16]
+        target_path = target_root / f"{safe_chat_id}.pdf"
+        temp_path = target_root / f".{safe_chat_id}.uploading"
+        temp_path.write_bytes(pdf_bytes)
+        temp_path.replace(target_path)
+        saved_pdf_path = str(target_path.resolve())
+
+    index_path = str(Path(document["artifacts"]["index"]).resolve())
+    document.update({
+        "chat_id": chat_id,
+        "file_path": saved_pdf_path,
+        "saved_pdf_path": saved_pdf_path,
+        "rag": {
+            "document_id": chat_id,
+            "index_path": index_path,
+            "model_name": model_name,
+            "chunk_mode": chunk_mode,
+            "chunk_size": chunk_size,
+            "overlap": overlap,
+        },
+    })
+    return document
+
+
+def build_upload_response(document: dict) -> dict:
+    """Return the stable Day 2 upload response for a richer Day 3 record."""
+    pages = document.get("pages", [])
+    return {
+        "status": "ok",
+        "filename": str(document.get("filename", "")),
+        "pages": len(pages),
+        "characters": sum(len(str(page.get("text", ""))) for page in pages),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Retrieval
 # ---------------------------------------------------------------------------
@@ -784,6 +904,22 @@ def search_bundle(
     if not chunks:
         return []
 
+    # A follow-up such as "give one more detail from that page" needs recent
+    # context to form a meaningful retrieval query. Fresh evidence is still
+    # retrieved every turn; history only helps resolve the query wording.
+    retrieval_query = question
+    if history:
+        recent_context: list[str] = []
+        for turn in history[-2:]:
+            prior_question = str(turn.get("question", "")).strip()
+            prior_answer = str(turn.get("answer", "")).strip()
+            if prior_question:
+                recent_context.append(f"Previous question: {prior_question}")
+            if prior_answer:
+                recent_context.append(f"Previous answer: {prior_answer[:500]}")
+        if recent_context:
+            retrieval_query = "\n".join([*recent_context, f"Current question: {question}"])
+
     # Embed the question
     manifest = bundle.get("manifest", {})
     model_name = manifest.get("model_name", DEFAULT_EMBED_MODEL_NAME)
@@ -791,7 +927,12 @@ def search_bundle(
         model_name=model_name,
         artifact_root=_resolve_artifact_root(bundle),
     )
-    q_vec = embed_texts([question], model=model, batch_size=batch_size, show_progress=False)
+    q_vec = embed_texts(
+        [retrieval_query],
+        model=model,
+        batch_size=batch_size,
+        show_progress=False,
+    )
     if q_vec.shape[1] != index.d:
         raise ValueError(
             f"Query embedding dimension {q_vec.shape[1]} does not match "
@@ -807,7 +948,7 @@ def search_bundle(
 
     # Collect hits
     hits: list[dict] = []
-    q_keywords = keyword_set(question)
+    q_keywords = keyword_set(retrieval_query)
 
     for idx, score in zip(indices[0], scores[0]):
         if idx < 0 or idx >= len(chunks):
@@ -961,12 +1102,50 @@ def build_sources(hits: list[dict]) -> list[dict]:
     return sources
 
 
+def build_grounded_user_prompt(
+    question: str,
+    hits: list[dict],
+    history: Union[list[dict], None] = None,
+) -> str:
+    """Build a history-aware prompt whose evidence stays page grounded."""
+    if not question.strip():
+        raise ValueError("question must not be empty")
+
+    history_lines: list[str] = []
+    for turn in (history or [])[-3:]:
+        prior_question = str(turn.get("question", "")).strip()
+        prior_answer = str(turn.get("answer", "")).strip()
+        citations = turn.get("citations", [])
+        if prior_question:
+            history_lines.append(f"User: {prior_question}")
+        if prior_answer:
+            citation_text = f" Citations: {citations}" if citations else ""
+            history_lines.append(f"Assistant: {prior_answer}{citation_text}")
+
+    evidence_blocks = [
+        f"[Page {hit.get('page')}]\n{str(hit.get('text', '')).strip()}"
+        for hit in hits
+        if str(hit.get("text", "")).strip()
+    ]
+    history_text = "\n".join(history_lines) or "(no earlier turns)"
+    evidence_text = "\n\n".join(evidence_blocks) or "(no relevant evidence found)"
+    return (
+        "Answer the current question using only the retrieved PDF evidence.\n"
+        "Use recent conversation only to understand references in the question.\n"
+        "Cite factual claims with [Page N]. If the evidence is insufficient, "
+        "say that the answer was not found.\n\n"
+        f"Recent conversation:\n{history_text}\n\n"
+        f"Retrieved PDF evidence:\n{evidence_text}\n\n"
+        f"Current question: {question}"
+    )
+
+
 def answer_document(
     document: dict,
     question: str,
     top_k: int = 3,
     candidate_pool: int = 60,
-    answer_model: str = "openrouter/free",
+    answer_model: str = "poolside/laguna-s-2.1:free",
 ) -> dict:
     """Retrieve evidence and return a stable app-facing answer payload.
 
@@ -981,6 +1160,10 @@ def answer_document(
         candidate_pool=candidate_pool,
         history=document.get("history"),
     )
+    # Build the exact grounded prompt needed by a later hosted-model branch.
+    # The workshop's default remains a deterministic local answer so the route
+    # works without an API key or network connection.
+    build_grounded_user_prompt(question, hits, history=document.get("history"))
     answer = best_sentence_answer(question, hits)
     return {
         "answer": answer,
@@ -1001,6 +1184,42 @@ def append_history(document: dict, question: str, result: dict) -> list[dict]:
         "sources": list(result.get("sources", [])),
     })
     return history
+
+
+def answer_document_turn(
+    document: dict,
+    question: str,
+    top_k: int = 3,
+    candidate_pool: int = 60,
+    answer_model: str = "poolside/laguna-s-2.1:free",
+) -> dict:
+    """Retrieve fresh evidence, answer, then append one successful turn."""
+    result = answer_document(
+        document=document,
+        question=question,
+        top_k=top_k,
+        candidate_pool=candidate_pool,
+        answer_model=answer_model,
+    )
+    history = append_history(document, question, result)
+    return {**result, "history": list(history)}
+
+
+def answer_chat_turn(
+    document: dict,
+    message: str,
+    top_k: int = 3,
+    candidate_pool: int = 60,
+    answer_model: str = "poolside/laguna-s-2.1:free",
+) -> dict:
+    """Project-facing alias for one retrieve-per-turn chat interaction."""
+    return answer_document_turn(
+        document=document,
+        question=message,
+        top_k=top_k,
+        candidate_pool=candidate_pool,
+        answer_model=answer_model,
+    )
 
 
 # ---------------------------------------------------------------------------

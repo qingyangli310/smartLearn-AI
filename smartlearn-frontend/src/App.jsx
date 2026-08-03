@@ -1,24 +1,29 @@
 import { useState } from "react";
-import { uploadPDF, askQuestion } from "./api.js";
+import ChatPanel from "./ChatPanel.jsx";
+import PdfPreview from "./PdfPreview.jsx";
+import { uploadPDF } from "./api.js";
 
 function App() {
   const [file, setFile] = useState(null);
   const [upload, setUpload] = useState(null);
-  const [message, setMessage] = useState("");
-  const [answer, setAnswer] = useState(null);
+  const [activePage, setActivePage] = useState(1);
+  const [uploadKey, setUploadKey] = useState(0);
   const [status, setStatus] = useState("idle");
+  const [chatBusy, setChatBusy] = useState(false);
   const [error, setError] = useState("");
 
-  const busy = status !== "idle";
+  const uploading = status === "uploading";
 
   const handleUpload = async () => {
-    setUpload(null);
-    setAnswer(null);
+    if (!file) return;
+
     setError("");
     setStatus("uploading");
     try {
       const data = await uploadPDF(file);
       setUpload(data);
+      setActivePage(1);
+      setUploadKey((current) => current + 1);
     } catch (requestError) {
       setError(requestError.message || "Upload failed.");
     } finally {
@@ -26,82 +31,67 @@ function App() {
     }
   };
 
-  const handleAsk = async () => {
-    setError("");
-    setAnswer(null);
-    setStatus("asking");
-    try {
-      const data = await askQuestion(message.trim());
-      setAnswer(data);
-    } catch (requestError) {
-      setError(requestError.message || "Chat failed.");
-    } finally {
-      setStatus("idle");
+  const handleJumpToPage = (page) => {
+    if (Number.isInteger(page) && page > 0) {
+      setActivePage(page);
     }
   };
 
   return (
-    <div className="app">
-      <h1>SmartLearn Lite</h1>
-      <p>Your AI-powered learning assistant</p>
+    <main className="app">
+      <header className="app-header">
+        <div>
+          <p className="eyebrow">Retrieval-augmented learning</p>
+          <h1>SmartLearn Lite</h1>
+          <p>Upload a PDF, ask grounded questions, and open cited pages.</p>
+        </div>
+      </header>
 
       {error && <div role="alert">{error}</div>}
 
-      <form onSubmit={(e) => { e.preventDefault(); handleUpload(); }}>
+      <form
+        className="upload-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          handleUpload();
+        }}
+      >
         <label htmlFor="pdf-file">PDF</label>
         <input
           id="pdf-file"
           type="file"
           accept=".pdf,application/pdf"
-          onChange={(e) => {
-            setFile(e.target.files[0] || null);
-            setUpload(null);
-            setAnswer(null);
+          onChange={(event) => {
+            setFile(event.target.files[0] || null);
             setError("");
           }}
         />
-        <button type="submit" disabled={!file || busy}>
-          {status === "uploading" ? "Uploading…" : "Upload"}
+        <button type="submit" disabled={!file || uploading || chatBusy}>
+          {uploading ? "Preparing PDF…" : "Upload"}
         </button>
       </form>
 
       {upload && (
-        <p>{upload.filename} — {upload.pages} pages, {upload.characters} characters</p>
+        <p className="upload-summary">
+          {upload.filename} — {upload.pages} pages, {upload.characters.toLocaleString()} characters
+        </p>
       )}
 
-      <form onSubmit={(e) => { e.preventDefault(); handleAsk(); }}>
-        <label htmlFor="question">Question</label>
-        <textarea
-          id="question"
-          rows={3}
-          value={message}
-          onChange={(e) => {
-            setMessage(e.target.value);
-            setError("");
-          }}
+      <div className="workspace">
+        <PdfPreview
+          upload={upload}
+          activePage={activePage}
+          previewKey={uploadKey}
         />
-        <button type="submit" disabled={!upload || !message.trim() || busy}>
-          {status === "asking" ? "Asking…" : "Ask"}
-        </button>
-      </form>
-
-      {answer && (
-        <>
-          <section>
-            <h2>Answer</h2>
-            <p>{answer.answer}</p>
-          </section>
-          {answer.citations?.length > 0 && (
-            <section>
-              <h2>Citations</h2>
-              {answer.citations.map((page) => (
-                <span key={page}>Page {page}</span>
-              ))}
-            </section>
-          )}
-        </>
-      )}
-    </div>
+        <ChatPanel
+          key={uploadKey}
+          enabled={Boolean(upload)}
+          disabled={uploading}
+          onBusy={setChatBusy}
+          onJumpToPage={handleJumpToPage}
+        />
+      </div>
+    </main>
   );
 }
 

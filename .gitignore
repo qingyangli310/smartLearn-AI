@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 test_files/
 /smartlearn-backend/artifacts/
+/smartlearn-backend/uploads/
