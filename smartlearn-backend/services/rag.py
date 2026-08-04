@@ -296,6 +296,7 @@ def build_chunks(
 # ---------------------------------------------------------------------------
 
 DEFAULT_EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+MIN_RELEVANCE_SCORE = 0.30
 _MODEL_CACHE: dict[tuple[str, str], Any] = {}
 _MODEL_REQUIRED_FILES = (
     "modules.json",
@@ -852,20 +853,22 @@ def build_upload_response(document: dict) -> dict:
 def keyword_set(text: str) -> set[str]:
     """Return a lightweight lexical token set for simple reranking.
 
-    Tokens are lowercased, filtered to alphabetic words of length
-    ≥ 3, and stemmed by stripping a trailing ``s`` (enough for
-    English plurals without a full stemmer dependency)."""
+    Tokens are lowercased and lightly stemmed.  Technical identifiers such
+    as ``BM25``, ``R&A``, ``ROUGE-L``, ``L3-70B``, and ``11T`` are retained;
+    these are often the exact short answers a document question asks for.
+    """
     stopwords = {
-        "and", "are", "for", "from", "how", "into", "paper", "that",
-        "the", "their", "this", "used", "using", "what", "when", "where",
+        "and", "are", "as", "at", "be", "by", "for", "from", "how",
+        "into", "is", "it", "of", "on", "or", "paper", "that", "the",
+        "their", "this", "to", "used", "using", "what", "when", "where",
         "which", "who", "why", "with",
     }
     tokens: set[str] = set()
-    for match in re.finditer(r"[a-z]{3,}", text.lower()):
+    for match in re.finditer(r"[a-z0-9]+(?:[&-][a-z0-9]+)*", text.lower()):
         word = match.group()
-        if word.endswith("s") and len(word) > 3:
+        if word.isalpha() and word.endswith("s") and len(word) > 3:
             word = word[:-1]
-        if word not in stopwords:
+        if len(word) >= 2 and word not in stopwords:
             tokens.add(word)
     return tokens
 
@@ -954,10 +957,16 @@ def search_bundle(
         if idx < 0 or idx >= len(chunks):
             continue
         chunk = chunks[idx]
-        # Lightweight lexical bonus: +0.02 per overlapping keyword (cap 0.10)
+        # Lightweight lexical bonus: +0.02 per overlapping keyword (cap 0.10).
+        # Exact intent qualifiers deserve extra weight: a chunk containing
+        # "default" is substantially more useful for a "used by default"
+        # question than one that merely repeats "model" and "agent".
         c_keywords = keyword_set(chunk["text"])
-        overlap = len(q_keywords & c_keywords)
-        bonus = min(overlap * 0.02, 0.10)
+        shared_keywords = q_keywords & c_keywords
+        overlap = len(shared_keywords)
+        intent_terms = {"default", "named"}
+        intent_bonus = 0.35 if shared_keywords & intent_terms else 0.0
+        bonus = min(overlap * 0.02, 0.10) + intent_bonus
         vector_score = float(score)
         hits.append({
             "page": chunk["page"],
@@ -1013,11 +1022,62 @@ def search_document(
 def split_sentences(text: str) -> list[str]:
     """Split *text* into candidate answer sentences.
 
-    Sentence boundaries are ``.``, ``!``, ``?`` followed by a
-    space, newline, or end-of-string.  Empty and whitespace-only
-    strings are filtered out."""
-    raw = re.split(r"(?<=[.!?])\s+|\n+", text)
+    PDF extraction commonly inserts line breaks in the middle of sentences
+    and hyphenates words at the right margin.  Repair those artifacts before
+    finding sentence boundaries so candidates such as ``comprehen-\nsive``
+    are not treated as incomplete answers.
+    """
+    if not text:
+        return []
+
+    # Join ordinary margin hyphenation while preserving technical names such
+    # as ``Llama-\n3.3-70B``.
+    normalized = re.sub(r"(?<=[A-Za-z])-\s*\n\s*(?=[a-z])", "", text)
+    normalized = re.sub(r"-\s*\n\s*(?=[A-Z0-9])", "-", normalized)
+    normalized = re.sub(r"\s*\n\s*", " ", normalized)
+    normalized = re.sub(r"[ \t]+", " ", normalized).strip()
+
+    raw = re.split(r"(?<=[.!?])\s+", normalized)
     return [s.strip() for s in raw if s.strip()]
+
+
+def _technical_identifiers(text: str) -> set[str]:
+    """Return likely short-answer entities from a candidate sentence."""
+    identifiers: set[str] = set()
+    for token in re.findall(r"\b[A-Za-z0-9]+(?:[&-][A-Za-z0-9]+)*\b", text):
+        normalized = token.replace("­", "").strip(".,").casefold()
+        uppercase_count = sum(character.isupper() for character in token)
+        if (
+            normalized
+            and (
+                any(character.isdigit() for character in token)
+                or "&" in token
+                or uppercase_count >= 2
+            )
+        ):
+            identifiers.add(normalized)
+    return identifiers
+
+
+def _answer_cue_score(question: str, sentence: str) -> float:
+    """Score generic linguistic clues that a sentence states an answer."""
+    q = question.casefold()
+    s = sentence.casefold()
+    score = 0.0
+    identifiers = _technical_identifiers(sentence)
+
+    asks_for_identifier = any(cue in q for cue in ("name", "model", "retriever"))
+    if asks_for_identifier and identifiers:
+        score += 1.25
+    elif asks_for_identifier:
+        score -= 1.5
+    if "metric" in q and "metric" in s:
+        score += 4.0 if identifiers else 2.0
+    if any(cue in q for cue in ("heading", "section")) and ":" in sentence:
+        score += 1.25
+    if re.search(r"\b(?:is|are|uses?|called|named|as the)\b", s):
+        score += 0.35
+    return score
 
 
 def best_sentence_answer(question: str, hits: list[dict]) -> str:
@@ -1033,15 +1093,29 @@ def best_sentence_answer(question: str, hits: list[dict]) -> str:
     q_keywords = keyword_set(question)
     best_sentence = ""
     best_page = None
-    best_score = -1
+    best_score = float("-inf")
 
-    for hit in hits:
+    for rank, hit in enumerate(hits):
         for sentence in split_sentences(hit["text"]):
             s_keywords = keyword_set(sentence)
             overlap = len(q_keywords & s_keywords)
-            # Prefer slightly shorter sentences when scores are equal
-            penalty = len(sentence) * 0.0001
-            score = overlap - penalty
+            coverage = overlap / max(len(q_keywords), 1)
+
+            # Prefer complete, answer-bearing sentences over fragments that
+            # merely repeat the wording of the question.  Retrieval rank is a
+            # useful signal, but remains weaker than sentence-level evidence.
+            score = overlap + coverage + _answer_cue_score(question, sentence)
+            score += max(0.0, 0.25 - rank * 0.08)
+            score += min(float(hit.get("score", 0.0)), 1.0) * 0.2
+
+            stripped = sentence.rstrip()
+            if stripped.endswith((",", ";", ":", "-")):
+                score -= 1.5
+            if len(sentence) < 20:
+                score -= 1.25
+            elif len(sentence) > 420:
+                score -= (len(sentence) - 420) * 0.002
+
             if score > best_score:
                 best_score = score
                 best_sentence = sentence
@@ -1160,6 +1234,14 @@ def answer_document(
         candidate_pool=candidate_pool,
         history=document.get("history"),
     )
+    sources = build_sources(hits)
+    if not hits or float(hits[0].get("score", 0.0)) < MIN_RELEVANCE_SCORE:
+        return {
+            "answer": "The answer was not found in the document.",
+            "citations": [],
+            "sources": sources,
+        }
+
     # Build the exact grounded prompt needed by a later hosted-model branch.
     # The workshop's default remains a deterministic local answer so the route
     # works without an API key or network connection.
@@ -1168,7 +1250,7 @@ def answer_document(
     return {
         "answer": answer,
         "citations": extract_citations(answer, hits),
-        "sources": build_sources(hits),
+        "sources": sources,
     }
 
 
